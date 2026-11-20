@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""chats - browse past Claude Code sessions and reopen one in herdr (claude --resume <id>).
+
+Reads Claude Code's own session files ($CLAUDE_PROJECTS/*/*.jsonl, default ~/.claude/projects) and keeps a
+small index in ~/.cache/chats/index.json so later runs only re-read changed files. Also used as a library by
+todo-view (the list of sessions to link to tasks).
+
+  chats                  pick from all sessions (fzf), Enter reopens it in a new herdr tab
+  chats pick [words]     same, only sessions whose title or first message has the words
+  chats list [words]     print the sorted list
+  chats --show-hidden    include sessions you hid with Ctrl-D (to unhide: edit ~/.cache/chats/hidden.txt)
+"""
+import datetime, glob, json, os, shlex, subprocess, sys
+from importlib.machinery import SourceFileLoader
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+al = SourceFileLoader("agentlib", f"{BIN}/agentlib").load_module()
+HOME = al.HOME
+CACHE_DIR = os.path.expanduser(os.environ.get("CHATS_CACHE", "~/.cache/chats"))
+INDEX = f"{CACHE_DIR}/index.json"
+HIDDEN = f"{CACHE_DIR}/hidden.txt"
+ME = os.path.realpath(__file__)
+INDEX_VERSION = 1
+WORKSPACE = "Chats"
+
+
+def user_text(msg):
+    content = (msg or {}).get("content")
+    if isinstance(content, str):
+        return content
+    for part in content or []:
+        if isinstance(part, dict) and part.get("type") == "text":
+            return part.get("text", "")
+    return ""
+
+
+def last_title(raw):
+    """Latest custom title (set by /rename or -n) wins over the latest AI title."""
+    for field in (b'"customTitle":"', b'"aiTitle":"'):
+        i = raw.rfind(field)
+        if i >= 0:
+            start = i + len(field)
+            end = raw.find(b'"', start)
+            while end > 0 and raw[end - 1:end] == b"\\":
+                end = raw.find(b'"', end + 1)
+            try:
+                return json.loads(b'"' + raw[start:end] + b'"')
+            except ValueError:
+                pass
+    return ""
+
+
+def read_session(path):
+    """Title, first prompt you typed, and the folder the session ran in."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    title, first, cwd = last_title(raw), "", ""
+    for ln in raw.split(b"\n"):
+        if b'"type":"user"' not in ln[:200] and not (not cwd and b'"cwd"' in ln):
+            continue
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        cwd = cwd or d.get("cwd", "")
+        if d.get("type") != "user" or d.get("isMeta") or first:
+            continue
+        t = user_text(d.get("message")).strip()
+        if t and not t.startswith("<"):
+            first = " ".join(t.split())[:300]
+    return dict(title=" ".join(title.split()), first=first, cwd=cwd, v=INDEX_VERSION)
+
+
+def load_index():
+    try:
+        return json.load(open(INDEX))
+    except (OSError, ValueError):
+        return {}
+
+
+def sessions():
+    """Every Claude Code session with a title or a first message, as dicts (sid, title, date, mtime, cwd, resume)."""
+    old, new = load_index(), {}
+    for p in glob.glob(f"{al.CLAUDE_PROJECTS}/*/*.jsonl"):
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        stamp = f"{st.st_mtime}:{st.st_size}"
+        rec = old.get(p)
+        if not rec or rec.get("stamp") != stamp or rec.get("v") != INDEX_VERSION:
+            try:
+                rec = read_session(p) | {"stamp": stamp, "mtime": st.st_mtime}
+            except OSError:
+                continue
+        new[p] = rec
+    if new != old:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = INDEX + ".tmp"
+        json.dump(new, open(tmp, "w"))
+        os.replace(tmp, INDEX)
+    for p, rec in new.items():
+        if not (rec["title"] or rec["first"]) or rec["cwd"].startswith(("/private/tmp", "/tmp")):
+            continue  # skip empty sessions and automated one-shot runs started in temp dirs
+        sid = os.path.basename(p)[:-6]
+        cwd = rec["cwd"] if rec["cwd"] and os.path.isdir(rec["cwd"]) else HOME
+        yield dict(date=datetime.date.fromtimestamp(rec["mtime"]).isoformat(), mtime=rec["mtime"],
+                   title=(rec["title"] or rec["first"])[:90], first=rec["first"], cwd=cwd,
+                   resume=f"claude --resume {sid}", sid=sid)
+
+
+def hidden():
+    try:
+        return set(open(HIDDEN).read().splitlines())
+    except OSError:
+        return set()
+
+
+def hide(raw_json):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(HIDDEN, "a") as f:
+        f.write(json.loads(raw_json)["sid"] + "\n")
+
+
+def newest(r):
+    return r["mtime"]
+
+
+def rows(words=""):
+    gone = set() if "--show-hidden" in sys.argv else hidden()
+    words = words.lower().split()
+    def hit(r):
+        hay = f"{r['title']} {r['first']}".lower()
+        return all(w in hay for w in words)
+    out = [r for r in sessions() if hit(r) and r["sid"] not in gone]
+    return sorted(out, key=newest, reverse=True)
+
+
+def line(r):
+    where = r["cwd"].replace(HOME, "~")[-28:]
+    shown = f"{r['date']}  {where:<28}  {r['title']}  {r['sid'][:8]}"
+    return shown + "\t" + json.dumps(r, ensure_ascii=False)
+
+
+def open_chat(r):
+    if not al.in_herdr():
+        os.chdir(r["cwd"])
+        os.execvp("sh", ["sh", "-c", r["resume"]])
+    ws = next((w["workspace_id"] for w in al.herdr("workspace", "list").get("workspaces", [])
+               if w.get("label") == WORKSPACE), None)
+    if not ws:
+        ws = al.herdr("workspace", "create", "--label", WORKSPACE, "--cwd", HOME, "--no-focus")["workspace"]["workspace_id"]
+    res = al.herdr("tab", "create", "--workspace", ws, "--cwd", r["cwd"], "--label", r["title"][:28], "--focus")
+    al.herdr("pane", "run", res["root_pane"]["pane_id"], r["resume"])
+
+
+def pick(words=""):
+    data = "\n".join(line(r) for r in rows(words))
+    preview = ("echo {2} | python3 -c 'import sys,json; r=json.load(sys.stdin); "
+               "print(r[\"title\"]); print(); print(r[\"cwd\"]); print(r[\"resume\"]); print(); print(r[\"first\"])'")
+    flags = "--show-hidden" if "--show-hidden" in sys.argv else ""
+    reload = f"{shlex.quote(ME)} raw {shlex.quote(words)} {flags}"
+    p = subprocess.run(["fzf", "--delimiter", "\t", "--with-nth", "1", "--tiebreak", "index",
+                        "--bind", f"ctrl-d:execute-silent({shlex.quote(ME)} hide {{2}})+reload({reload})",
+                        "--header", "Enter = reopen in a new herdr tab  ·  Ctrl-D = hide from list",
+                        "--preview", preview, "--preview-window", "right,45%,wrap"],
+                       input=data, stdout=subprocess.PIPE, text=True)
+    if p.returncode == 0 and p.stdout.strip():
+        open_chat(json.loads(p.stdout.strip().split("\t")[-1]))
+
+
+if __name__ == "__main__":
+    import signal
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    a = [x for x in sys.argv[1:] if x != "--show-hidden"]
+    if not a:
+        pick()
+    elif a[0] == "pick":
+        pick(" ".join(a[1:]))
+    elif a[0] == "raw":
+        for r in rows(" ".join(a[1:])):
+            print(line(r))
+    elif a[0] == "hide":
+        hide(a[1])
+    elif a[0] == "list":
+        for r in rows(" ".join(a[1:])):
+            print(line(r).rsplit("\t", 1)[0])
+    else:
+        print(__doc__)

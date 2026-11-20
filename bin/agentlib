@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Shared helpers for the Today scripts: paths, the herdr CLI, the per-session brief file, the transcript tail,
+and a verdict that says what a Claude session needs from you (working / needs you / can close / paused).
+No model, no tokens.
+
+Loaded by today, todo-view, brief, agent-close and todayctl with SourceFileLoader.
+
+Brief file: $TODAY_HOME/briefs/<first 8 chars of the session id>.md, kept by the Claude session itself (rule in
+your CLAUDE.md, see README). Lines that start with "name:", "task:", "status:", "next:", "waiting:", "progress:"
+(0-100) and "eta:" are read as fields; lines under "promises:" (one "- " item each) are follow-ups.
+
+Environment (all optional):
+  TODAY_TODO       the task list              (default ~/todo.md)
+  TODAY_HOME       state dir, briefs, jobs    (default ~/.cache/today)
+  TODAY_PROJECT    folder new sessions start in (default ~)
+  CLAUDE_PROJECTS  Claude Code transcripts    (default ~/.claude/projects)
+"""
+import glob, json, os, re, subprocess, time
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+TODO = os.path.expanduser(os.environ.get("TODAY_TODO", "~/todo.md"))
+STATE_DIR = os.path.expanduser(os.environ.get("TODAY_HOME", "~/.cache/today"))
+PROJECT = os.path.expanduser(os.environ.get("TODAY_PROJECT", "~"))
+CLAUDE_PROJECTS = os.path.expanduser(os.environ.get("CLAUDE_PROJECTS", "~/.claude/projects"))
+BRIEFS = f"{STATE_DIR}/briefs"
+JOBS = f"{STATE_DIR}/jobs"
+QUICK = f"{STATE_DIR}/quick.json"
+FIELD = re.compile(r"^(name|status|next|waiting|task|progress|eta):\s*(.*)$", re.I)
+NOTHING = ("none", "—", "-", "none known", "nothing", "n/a", "нет")
+
+
+# ---------- herdr ----------
+
+def herdr(*args):
+    """Run a herdr CLI command and return its JSON "result" ({} on any failure, e.g. herdr not running)."""
+    try:
+        out = subprocess.run(["herdr", *args], capture_output=True, text=True)
+    except OSError:
+        return {}
+    try:
+        return json.loads(out.stdout).get("result", {}) or {}
+    except (ValueError, AttributeError):
+        return {}
+
+
+def in_herdr():
+    return os.environ.get("HERDR_ENV") == "1"
+
+
+# ---------- brief ----------
+
+def brief_path(sid):
+    return f"{BRIEFS}/{sid[:8]}.md"
+
+
+def read_brief(sid):
+    """{'text', 'mtime', 'name', 'status', 'next', 'waiting', 'promises': [...]} or {} when there is none."""
+    path = brief_path(sid)
+    try:
+        text = open(path).read()
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    out = {"text": text, "mtime": mtime, "promises": []}
+    in_promises = False
+    for line in text.splitlines():
+        m = FIELD.match(line.strip())
+        if m:
+            out[m.group(1).lower()] = m.group(2).strip()
+            in_promises = False
+            continue
+        if line.strip().lower().startswith("promises:"):
+            in_promises = True
+            continue
+        if in_promises and line.strip().startswith("- "):
+            item = line.strip()[2:].strip()
+            if item and item.lower().strip(" .") not in NOTHING:
+                out["promises"].append(item)
+        elif in_promises and line.strip() and not line.startswith(" "):
+            in_promises = False
+    return out
+
+
+def quick_sids():
+    try:
+        return set(json.load(open(QUICK)))
+    except (OSError, ValueError):
+        return set()
+
+
+def mark_quick(sid):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    json.dump(sorted(quick_sids() | {sid}), open(QUICK, "w"))
+
+
+# ---------- progress ----------
+
+PERCENT = re.compile(r"^~?\s*(\d{1,3})\s*%?")
+
+
+def progress_of(brief):
+    """The brief's progress as an int 0-100, or None when it has no (readable) progress field."""
+    m = PERCENT.match(brief.get("progress", "").strip())
+    if not m:
+        return None
+    return min(100, int(m.group(1)))
+
+
+def bar(percent, width=10):
+    """'██████░░░░' for 60 with width 10."""
+    full = round(percent * width / 100)
+    return "█" * full + "░" * (width - full)
+
+
+def short(text, width):
+    """Text cut to width characters, with '…' when cut."""
+    text = " ".join(text.split())
+    if len(text) <= width:
+        return text
+    return text[:width - 1].rstrip(" ,.;:-·") + "…"
+
+
+def progress_line(brief, width=10):
+    """'██████░░░░ 60%' or '' when the brief has no progress."""
+    percent = progress_of(brief)
+    if percent is None:
+        return ""
+    return f"{bar(percent, width)} {percent}%"
+
+
+def eta_of(brief):
+    """The brief's eta ('~20 min'), or '' when it has none or says it does not know."""
+    eta = brief.get("eta", "").strip()
+    if eta.lower().strip(" .") in ("", "-", "—", "none", "n/a", "unknown", "?"):
+        return ""
+    return eta
+
+
+# ---------- keys on the Russian layout ----------
+
+RU = "йцукенгшщзхъфывапролджэячсмитьбюЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮё"
+EN = "qwertyuiop[]asdfghjkl;'zxcvbnm,.QWERTYUIOP[]ASDFGHJKL;'ZXCVBNM,.`"
+LATIN = dict(zip(RU, EN))
+
+
+def latin(ch):
+    """A key typed on the Russian layout -> the key in the same place on the English one (ы -> s, С -> C)."""
+    return LATIN.get(ch, ch)
+
+
+# ---------- transcript ----------
+
+def transcript(sid):
+    for path in glob.glob(f"{CLAUDE_PROJECTS}/*/{sid}.jsonl"):
+        return path
+    return ""
+
+
+def _text_of(content):
+    if isinstance(content, str):
+        return content
+    parts = []
+    for c in content or []:
+        if isinstance(c, dict) and c.get("type") == "text":
+            parts.append(c.get("text", ""))
+    return "\n".join(parts)
+
+
+_TAIL = {}
+
+
+def tail(sid, size=400_000):
+    """(last thing you typed, last thing Claude wrote, transcript mtime). Reads only the end of the file;
+    cached until the transcript changes."""
+    path = transcript(sid)
+    if not path:
+        return "", "", 0
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return "", "", 0
+    hit = _TAIL.get(path)
+    if hit and hit[2] == mtime:
+        return hit
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - size))
+            raw = f.read().decode("utf-8", "replace")
+    except OSError:
+        return "", "", 0
+    user, said = "", ""
+    for line in raw.splitlines()[1:] if len(raw) >= size else raw.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        msg = rec.get("message") or {}
+        if rec.get("type") == "user" and msg.get("role") == "user" and not rec.get("isMeta"):
+            text = _text_of(msg.get("content")).strip()
+            if text and not text.startswith(("<", "Caveat:", "This session is being continued")) and "tool_use_id" not in line[:300]:
+                user = text
+        elif rec.get("type") == "assistant":
+            text = _text_of(msg.get("content")).strip()
+            if text:
+                said = text
+    _TAIL[path] = (user, said, mtime)
+    return user, said, mtime
+
+
+# ---------- uncommitted work ----------
+
+_DIRTY = {}
+
+
+def dirty(folder):
+    """True when folder is inside a git checkout with uncommitted changes to tracked files (cached a minute)."""
+    if not folder or not os.path.isdir(folder):
+        return False
+    hit = _DIRTY.get(folder)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    r = subprocess.run(["git", "-C", folder, "status", "--porcelain", "--untracked-files=no"],
+                       capture_output=True, text=True)
+    out = r.returncode == 0 and bool(r.stdout.strip())
+    _DIRTY[folder] = (time.time(), out)
+    return out
+
+
+def agent_folder(agent):
+    """The folder the agent's pane is in now (its foreground cwd), for the uncommitted-changes check."""
+    return agent.get("foreground_cwd") or agent.get("cwd") or ""
+
+
+# ---------- verdict ----------
+
+def ago(seconds):
+    if seconds < 3600:
+        return f"{max(1, int(seconds // 60))}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def asks_me(said):
+    """Claude's last message ends with a question to you."""
+    end = re.sub(r"[\s*_`)\].]+$", "", said[-300:])
+    return end.endswith("?")
+
+
+def verdict(agent, task_done=False, quick=False):
+    """(label, kind) for an open agent. kind is one of working / you / close / paused.
+    task_done: the session's task is ticked off in todo.md."""
+    status = agent.get("agent_status")
+    sid = (agent.get("agent_session") or {}).get("value", "")
+    if status == "working":
+        return "working", "working"
+    if status == "blocked":
+        return "needs you: permission", "you"
+    _, said, mtime = tail(sid) if sid else ("", "", 0)
+    idle = time.time() - mtime if mtime else 0
+    if not mtime:
+        return "new: nothing typed", "paused"
+    if asks_me(said) and idle < 12 * 3600:
+        return "needs you: answer", "you"
+    if dirty(agent_folder(agent)):
+        return f"paused {ago(idle)} · uncommitted", "paused"
+    if task_done:
+        return "can close: task done", "close"
+    if quick and idle > 1800:
+        return f"can close: quick, {ago(idle)} idle", "close"
+    if idle > 24 * 3600:
+        return f"can close: {ago(idle)} idle", "close"
+    return f"paused {ago(idle)}", "paused"

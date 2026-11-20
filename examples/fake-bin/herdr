@@ -1,0 +1,9 @@
+#!/bin/sh
+# Stand-in for the herdr CLI, used only by examples/demo.sh: `herdr agent list` answers with the four sample
+# sessions in agents.json; every other command answers with an empty result and does nothing.
+here=$(cd "$(dirname "$0")" && pwd)
+if [ "$1 $2" = "agent list" ]; then
+  printf '{"result":'; cat "$here/agents.json"; printf '}\n'
+else
+  printf '{"result":{}}\n'
+fi

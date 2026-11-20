@@ -1,0 +1,56 @@
+{
+ "agents": [
+  {
+   "agent": "claude",
+   "agent_session": {
+    "value": "a1b2c3d4-0000-4000-8000-000000000001"
+   },
+   "agent_status": "working",
+   "pane_id": "p1",
+   "tab_id": "t1",
+   "workspace_id": "w1",
+   "cwd": "",
+   "state_change_seq": 4,
+   "terminal_title_stripped": ""
+  },
+  {
+   "agent": "claude",
+   "agent_session": {
+    "value": "b2c3d4e5-0000-4000-8000-000000000002"
+   },
+   "agent_status": "idle",
+   "pane_id": "p2",
+   "tab_id": "t2",
+   "workspace_id": "w2",
+   "cwd": "",
+   "state_change_seq": 3,
+   "terminal_title_stripped": ""
+  },
+  {
+   "agent": "claude",
+   "agent_session": {
+    "value": "c3d4e5f6-0000-4000-8000-000000000003"
+   },
+   "agent_status": "idle",
+   "pane_id": "p3",
+   "tab_id": "t3",
+   "workspace_id": "w2",
+   "cwd": "",
+   "state_change_seq": 2,
+   "terminal_title_stripped": ""
+  },
+  {
+   "agent": "claude",
+   "agent_session": {
+    "value": "d4e5f6a7-0000-4000-8000-000000000004"
+   },
+   "agent_status": "idle",
+   "pane_id": "p4",
+   "tab_id": "t4",
+   "workspace_id": "w2",
+   "cwd": "",
+   "state_change_seq": 1,
+   "terminal_title_stripped": ""
+  }
+ ]
+}

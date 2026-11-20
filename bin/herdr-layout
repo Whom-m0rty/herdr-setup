@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Build the herdr layout: a Today workspace first (and focused), one workspace per #area in your todo.md (its
+first tab runs `today <area>`), and a Chats workspace with the session picker. Safe to re-run: existing
+workspaces and tabs are kept. Run it after a reboot or a herdr restart.
+
+  herdr-layout            build what is missing, focus Today
+  herdr-layout --rebuild  close the layout workspaces and build them again in order
+                          (refuses if one has tabs other than the layout's own, so open sessions are never killed)
+
+Today workspace: Claude on the left (started in $TODAY_PROJECT, default ~), `today all` on the right.
+"""
+import os, sys
+from importlib.machinery import SourceFileLoader
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+al = SourceFileLoader("agentlib", f"{BIN}/agentlib").load_module()
+tv = SourceFileLoader("todo_view", f"{BIN}/todo-view").load_module()
+HOME = al.HOME
+OWN_TABS = ("Today", "Tasks", "Chats")
+
+
+h = al.herdr
+
+
+def layout():
+    """(workspace label, area or None) in sidebar order."""
+    areas = [a for a in tv.areas(tv.parse_todo()) if a != "other"]
+    return [("Today", None)] + [(a.capitalize(), a) for a in areas] + [("Chats", None)]
+
+
+def workspaces():
+    return {w["label"]: w["workspace_id"] for w in h("workspace", "list").get("workspaces", [])}
+
+
+def rebuild(mine):
+    for label, ws in workspaces().items():
+        if label not in mine:
+            continue
+        extra = [t["label"] for t in h("tab", "list", "--workspace", ws).get("tabs", []) if t["label"] not in OWN_TABS]
+        if extra:
+            sys.exit(f"'{label}' has other tabs open ({', '.join(extra)}); close them first or run without --rebuild")
+    for label, ws in workspaces().items():
+        if label in mine:
+            h("workspace", "close", ws)
+
+
+def close_default_shell():
+    """herdr opens a '~' workspace on first start; drop it if it is just an idle shell, so Today is on top."""
+    for label, ws in workspaces().items():
+        if label != "~":
+            continue
+        panes = h("pane", "list", "--workspace", ws).get("panes", [])
+        if len(panes) != 1:
+            continue
+        info = h("pane", "process-info", "--pane", panes[0]["pane_id"]).get("process_info", {})
+        if info and info.get("foreground_process_group_id") == info.get("shell_pid"):
+            h("workspace", "close", ws)
+
+
+def build(plan):
+    have = workspaces()
+    for label, area in plan:
+        if label in have:
+            continue
+        r = h("workspace", "create", "--label", label, "--cwd", HOME, "--no-focus")
+        first = r["root_pane"]["pane_id"]
+        if label == "Today":
+            h("tab", "rename", r["tab"]["tab_id"], "Today")
+            h("pane", "run", first, f"cd {al.PROJECT} && claude")  # Claude on the left
+            right = h("pane", "split", first, "--direction", "right", "--cwd", HOME, "--no-focus")["pane"]["pane_id"]
+            h("pane", "run", right, f"while true; do {BIN}/today all; sleep 1; done")
+        elif label == "Chats":
+            h("tab", "rename", r["tab"]["tab_id"], "Chats")
+            h("pane", "run", first, f"while true; do {BIN}/chats pick; done")
+        else:
+            h("tab", "rename", r["tab"]["tab_id"], "Tasks")
+            h("pane", "run", first, f"while true; do {BIN}/today {area}; sleep 1; done")
+    close_default_shell()
+    h("workspace", "focus", workspaces()["Today"])
+    for w in h("workspace", "list").get("workspaces", []):
+        print(w["number"], w["label"])
+
+
+if __name__ == "__main__":
+    if not al.in_herdr():
+        sys.exit("run this inside herdr (HERDR_ENV=1)")
+    plan = layout()
+    if "--rebuild" in sys.argv:
+        rebuild({label for label, _ in plan})
+    build(plan)

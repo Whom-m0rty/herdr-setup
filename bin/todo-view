@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Live read-only task view for a herdr pane: areas -> tasks -> the Claude sessions that worked on each task.
+No model, no tokens. Also the task parser that today, todayctl and brief load as a library.
+
+usage: todo-view [<area>|all] [--once]
+
+Sources
+  tasks     ~/todo.md (or $TODAY_TODO):  - [ ] Fix the backup script #home due 2026-12-01 [s:1a2b3c4d]
+  sessions  Claude Code session files, via ./chats
+
+A task's area is its first #tag (#home, #work, #study ...); untagged tasks are in "other".
+A session belongs to a task when the session's id starts with one of the task's [s:...] tags.
+--once prints the view once and exits (for scripts and tests).
+"""
+import datetime, os, re, shutil, sys, textwrap, time
+from importlib.machinery import SourceFileLoader
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+al = SourceFileLoader("agentlib", f"{BIN}/agentlib").load_module()
+chats = SourceFileLoader("chats", f"{BIN}/chats").load_module()
+HOME = al.HOME
+PATH = al.TODO
+B, D, R, Y, G, C, X = "\033[1m", "\033[2m", "\033[31m", "\033[33m", "\033[32m", "\033[36m", "\033[0m"
+ITEM = re.compile(r"^- \[( |x)\] (.*)$")
+AREA_TAG = re.compile(r"(?<![\w&/])#([A-Za-z][\w-]*)")
+SESSION_TAG = re.compile(r"\s*\[s:([0-9a-f]{4,})\]")
+DUE = re.compile(r"\s*due (\d{4}-\d{2}-\d{2})\s*")
+ANSI = re.compile(r"\033\[[0-9;]*m")
+SECTIONS = ("now", "next", "waiting")
+SESSIONS_EVERY = 60
+SESSIONS_PER_TASK = 3
+DISK = "/System/Volumes/Data" if os.path.isdir("/System/Volumes/Data") else "/"
+
+
+# ---------- sources ----------
+
+def load_sessions():
+    try:
+        return list(chats.sessions())
+    except Exception:
+        return []
+
+
+def parse_todo():
+    """Open tasks from todo.md: dicts with section, area, text, due, session tags, line number and raw line."""
+    sec, tasks = None, []
+    try:
+        lines = open(PATH).read().splitlines()
+    except OSError:
+        return []
+    for n, ln in enumerate(lines):
+        if ln.startswith("# "):
+            sec = (ln[2:].strip().split() or [""])[0].lower()
+            continue
+        if sec not in SECTIONS:
+            continue
+        m = ITEM.match(ln)
+        if m:
+            if m.group(1) == "x":
+                continue
+            text = m.group(2)
+        elif sec == "waiting" and ln.startswith("- "):
+            text = ln[2:]
+        else:
+            continue
+        area = AREA_TAG.search(text)
+        due = DUE.search(text)
+        sids = SESSION_TAG.findall(text)
+        clean = SESSION_TAG.sub("", text).strip()
+        tasks.append(dict(section=sec, area=area.group(1).lower() if area else "other", text=clean,
+                          due=due.group(1) if due else "", sids=sids, line=n, raw=ln))
+    return tasks
+
+
+def done_sids():
+    """Session tags on ticked lines (# Done or [x]): those sessions' tasks are finished."""
+    try:
+        text = open(PATH).read()
+    except OSError:
+        return set()
+    out = set()
+    for ln in text.splitlines():
+        if ln.startswith("- [x]"):
+            out |= set(SESSION_TAG.findall(ln))
+    return out
+
+
+def areas(tasks):
+    """Areas in the order they first appear in todo.md, 'other' last."""
+    seen = []
+    for t in tasks:
+        if t["area"] not in seen and t["area"] != "other":
+            seen.append(t["area"])
+    return seen + (["other"] if any(t["area"] == "other" for t in tasks) else [])
+
+
+# ---------- linking ----------
+
+def sessions_for(task, sessions):
+    hits = [s for s in sessions if any(s["sid"].startswith(p) for p in task["sids"])]
+    return sorted(hits, key=chats.newest, reverse=True)
+
+
+def build(sessions):
+    """Open tasks from todo.md, each with the sessions tagged on it."""
+    tasks = parse_todo()
+    for t in tasks:
+        t["sessions"] = sessions_for(t, sessions)
+    return tasks
+
+
+def display_text(text):
+    """Task text without its due date (shown separately)."""
+    return DUE.sub(" ", text).strip()
+
+
+# ---------- drawing ----------
+
+def wrap(text, width, first, rest):
+    body = textwrap.wrap(text, max(10, width - len(ANSI.sub("", first)))) or [""]
+    return [first + body[0]] + [rest + b for b in body[1:]]
+
+
+def task_lines(t, w, today):
+    mark = {"now": Y + "now " + X, "waiting": D + "wait " + X}.get(t["section"], "")
+    tail = f"  {R if t['due'] < today else D}due {t['due']}{X}" if t["due"] else ""
+    out = wrap(display_text(t["text"]), w - 4, "    - " + mark, "      ")
+    out[-1] += tail
+    shown = t["sessions"][:SESSIONS_PER_TASK]
+    for s in shown:
+        out.append(f"      {C}↳{X} {D}{s['date'][5:]}{X} {s['title'][:max(10, w - 26)]} {D}{s['sid'][:8]}{X}")
+    if len(t["sessions"]) > len(shown):
+        out.append(f"      {D}↳ +{len(t['sessions']) - len(shown)} more (chats){X}")
+    return out
+
+
+def disk_line():
+    total, used, free = shutil.disk_usage(DISK)
+    gb = 1000 ** 3
+    pct = free / total * 100
+    colour = R if free < 20 * gb or pct < 10 else (Y if pct < 20 else G)
+    return f"{B}Disk{X} {colour}{free / gb:.0f} GB free{X} {D}of {total / gb:.0f} GB ({pct:.0f}%){X}"
+
+
+def render(sessions, view, rows=None):
+    cols, height = shutil.get_terminal_size()
+    w = max(30, cols - 1)
+    today = datetime.date.today().isoformat()
+    tasks = build(sessions)
+    out = [B + ("Today" if view == "all" else "#" + view) + X + D + f"  {datetime.datetime.now():%H:%M}" + X,
+           disk_line(), ""]
+    order = {s: i for i, s in enumerate(SECTIONS)}
+    def by_section(t):
+        return order.get(t["section"], len(order))
+    for area in areas(tasks):
+        if view not in ("all", area):
+            continue
+        mine = sorted([t for t in tasks if t["area"] == area], key=by_section)
+        out.append(f"{B}{C}{'#' + area if area != 'other' else 'Other'}{X}  {D}{len(mine)} task{'s' if len(mine) != 1 else ''}{X}")
+        for t in mine:
+            out += task_lines(t, w, today)
+        out.append("")
+    if not tasks:
+        out.append(D + f"no open tasks in {PATH}" + X)
+    limit = rows or height
+    if len(out) > limit - 1:
+        hidden = len(out) - (limit - 2)
+        out = out[:limit - 2] + [D + f"… {hidden} more lines: zoom this pane" + X]
+    return out
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    view = (args[0] if args else "all").lower().lstrip("#")
+    if "--once" in sys.argv:
+        text = "\n".join(render(load_sessions(), view, rows=10_000))
+        print(text if sys.stdout.isatty() else ANSI.sub("", text))
+        return
+    last, sessions, sessions_at = None, [], 0
+    while True:
+        if time.time() - sessions_at > SESSIONS_EVERY:
+            sessions, sessions_at = load_sessions(), time.time()
+            last = None
+        try:
+            todo_stamp = os.stat(PATH).st_mtime
+        except OSError:
+            todo_stamp = None
+        stamp = (todo_stamp, shutil.get_terminal_size(), datetime.datetime.now().strftime("%H:%M"))
+        if stamp != last:
+            sys.stdout.write("\033[H\033[2J\033[3J" + "\n".join(render(sessions, view)))
+            sys.stdout.flush()
+            last = stamp
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

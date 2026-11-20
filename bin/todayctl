@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Drive Today from the command line (or from a Claude chat): the same actions as the keys, on the same files.
+
+  todayctl status                          open sessions + what they need, # Now, follow-ups
+  todayctl find <words>                    tasks matching the words
+  todayctl add "<text>" [--area A] [--now] add a task (# Next, or # Now with --now)
+  todayctl now <match>                     move a task between Now and Next            (key m)
+  todayctl done <match>                    tick a task, move it to # Done              (key x)
+  todayctl undo                            put the last ticked task back               (key u)
+  todayctl session <match> [--prompt "<first message>"] [--bg]
+                                           start a Claude session on a task            (key n); --prompt sends
+                                           the first message once Claude is ready; --bg keeps focus where it is
+  todayctl quick                           start a quick-question session              (key s)
+  todayctl go <match|sid8>                 switch herdr to an open session
+  todayctl next-you                        switch to the next session that needs you   (key g)
+  todayctl close <match|sid8> [--now]      close a session (handoff first unless --now) (key c)
+
+<match> = words from the task text; it must pick exactly one task (otherwise the candidates are printed).
+Today redraws by itself when the todo file changes.
+"""
+import json, os, subprocess, sys, time
+from importlib.machinery import SourceFileLoader
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.argv, ARGS = ["today", "all"], sys.argv[1:]
+t = SourceFileLoader("today_lib", f"{BIN}/today").load_module()
+al, tv = t.al, t.tv
+
+
+def model():
+    m = t.Model()
+    m.load()
+    return m
+
+
+def matches(m, words):
+    words = words.lower().split()
+    def hit(task):
+        return all(w in task["text"].lower() for w in words)
+    return [x for x in m.tasks if hit(x)]
+
+
+def one(m, words):
+    found = matches(m, words)
+    if len(found) == 1:
+        return found[0]
+    print(f"{len(found)} tasks match '{words}':" if found else f"no task matches '{words}'")
+    for x in found[:15]:
+        print(f"  [{x['section']}] {x['text'][:100]}")
+    sys.exit(1)
+
+
+def session_sid(m, words):
+    """An open session by sid prefix, by name, or by its task."""
+    for sid in m.agents:
+        if sid.startswith(words):
+            return sid
+    by_name = [sid for sid in m.agents if words.lower() in m.session_name(sid).lower()]
+    if len(by_name) == 1:
+        return by_name[0]
+    task = one(m, words)
+    live = [s["sid"] for s in task["sessions"] if s["sid"] in m.agents]
+    if not live:
+        sys.exit(f"no open session for: {task['text'][:80]}")
+    return live[0]
+
+
+def status(m):
+    def urgent(sid):
+        return t.URGENCY.get(m.verdicts[sid][1], 2)
+    print(f"Open sessions ({len(m.agents)}):")
+    for sid in sorted(m.agents, key=urgent):
+        b = al.read_brief(sid)
+        bar = al.progress_line(b)
+        extra = (f"  {bar}" if bar else "") + (f"  next: {b['next']}" if b.get("next") else "")
+        print(f"  {m.verdicts[sid][0]:<26} {m.session_name(sid)[:60]}  ({sid[:8]}){extra}")
+    if not m.agents:
+        print("  none")
+    for section in tv.SECTIONS:
+        tasks = [x for x in m.tasks if x["section"] == section]
+        print(f"\n# {section.capitalize()} ({len(tasks)}):")
+        for x in tasks:
+            n = len(x["sessions"])
+            sessions = f"  · {n} session{'s' if n != 1 else ''}" if n else ""
+            due = f"  due {x['due']}" if x["due"] else ""
+            print(f"  #{x['area']:<8} {tv.display_text(x['text'])[:90]}{due}{sessions}")
+    follow = t.followups(m)
+    if follow:
+        print(f"\nFollow-ups from sessions ({len(follow)}):")
+        for f in follow:
+            print(f"  {f['text'][:100]}  (from {f['name'][:30]})")
+    jobs = t.recent_jobs()
+    if jobs:
+        print(f"\nBackground jobs, last 24 h ({len(jobs)}):")
+        for j in jobs:
+            state = "running" if j.get("exit") is None else ("done" if j["exit"] == 0 else f"failed ({j['exit']})")
+            print(f"  {state:<11} {j['label'][:60]}  {j.get('last', '')[:60]}")
+
+
+def send_when_ready(pane, message):
+    """Wait (up to 3 minutes) until Claude in the pane is up and idle, then send the first message."""
+    for _ in range(90):
+        time.sleep(2)
+        agent = al.herdr("agent", "get", pane).get("agent", {})
+        if agent.get("agent_status") in ("idle", "done"):
+            time.sleep(2)
+            al.herdr("agent", "prompt", pane, message)
+            return
+
+
+def parse(rest):
+    opts, words, i = {}, [], 0
+    while i < len(rest):
+        if rest[i].startswith("--"):
+            key = rest[i][2:]
+            if i + 1 < len(rest) and not rest[i + 1].startswith("--"):
+                opts[key] = rest[i + 1]
+                i += 2
+            else:
+                opts[key] = True
+                i += 1
+        else:
+            words.append(rest[i])
+            i += 1
+    return opts, " ".join(words)
+
+
+def main():
+    if not ARGS or ARGS[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    cmd = ARGS[0]
+    opts, text = parse(ARGS[1:])
+    if cmd == "_send":
+        send_when_ready(ARGS[1], " ".join(ARGS[2:]))
+        return
+    m = model()
+    if cmd == "status":
+        status(m)
+    elif cmd == "find":
+        for x in matches(m, text)[:30]:
+            print(f"[{x['section']}] #{x['area']} {x['text'][:100]}")
+    elif cmd == "add":
+        print(t.add_task(text, opts.get("area", ""), "now" if opts.get("now") else "next"))
+    elif cmd == "now":
+        print(t.toggle_now(one(m, text)))
+    elif cmd == "done":
+        print(t.mark_done(one(m, text)))
+    elif cmd == "undo":
+        print(t.undo_done())
+    elif cmd == "session":
+        print(t.new_session(m, one(m, text), focus=not opts.get("bg")))
+        pane, sid = t.LAST_OPENED.get("pane"), t.LAST_OPENED.get("sid", "")
+        if opts.get("prompt") and pane:
+            subprocess.Popen([sys.executable, os.path.realpath(__file__), "_send", pane, opts["prompt"]],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            print(f"session {sid[:8]}: first message goes in as soon as Claude is ready")
+    elif cmd == "quick":
+        print(t.quick_session(m))
+    elif cmd == "go":
+        sid = session_sid(m, text)
+        print(t.activate(m, dict(kind="agent", obj=sid)))
+    elif cmd == "next-you":
+        print(t.next_needing_me(m))
+    elif cmd == "close":
+        sid = session_sid(m, text)
+        agent = m.agents[sid]
+        args = [f"{BIN}/agent-close", agent["pane_id"], sid] + (["--now"] if opts.get("now") else [])
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        print(f"closing {m.session_name(sid)[:60]} ({'now' if opts.get('now') else 'handoff first'})")
+    else:
+        sys.exit(f"unknown command {cmd}\n{__doc__}")
+
+
+if __name__ == "__main__":
+    main()

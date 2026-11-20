@@ -1,0 +1,1150 @@
+#!/usr/bin/env python3
+"""Today: an interactive task + session tree for a herdr pane. Your todo.md tasks, the Claude Code sessions that
+work on them, what each open session needs from you, follow-ups promised in session briefs, and background jobs.
+
+usage: today [<area>|all]
+
+Home screen (today all)
+  Today            the tasks under # Now, numbered
+  Open sessions    every Claude pane open in herdr, most urgent first: needs you / working / paused / can close
+  Follow-ups       promises written in session briefs that are not in todo.md yet (a add · h hide)
+  Background jobs  jobs started with ./job in the last 24 hours (Enter opens the log)
+
+Keys (each letter also works on the Russian layout)
+  click / Enter / →   open or close a row; session: go to it (or resume it); "+ new session": start one
+  ←                   close the row (or jump to its parent)
+  e                   switch between the home screen and the full tree (all areas -> tasks -> sessions)
+  n                   new Claude session for the selected task (tags the task line with [s:<id>])
+  s                   quick-question session (not tied to a task)
+  g                   jump to the next session that needs you (cycles)
+  c                   close the selected open session (it updates its brief first)
+  a                   add a task (under the selected area); on a follow-up: add it to # Next
+  h                   hide the selected follow-up
+  x / u               tick the task (moves to # Done with today's date) / undo the last tick
+  m                   move a task between # Now and # Next
+  p                   plan the day: pick what goes into # Now
+  r                   reload        q  quit (a pane loop restarts it)
+
+Nothing here calls a model. Sources: todo.md (./todo-view), Claude Code session files (./chats), `herdr agent
+list` (which sessions are open right now), session briefs and ./job records in $TODAY_HOME.
+Only `today all` reports to the herdr sidebar and opens brief panes.
+"""
+import curses, datetime, glob, json, locale, os, re, shlex, shutil, subprocess, sys, time, uuid
+from importlib.machinery import SourceFileLoader
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+al = SourceFileLoader("agentlib", f"{BIN}/agentlib").load_module()
+tv = SourceFileLoader("todo_view", f"{BIN}/todo-view").load_module()
+HOME, PROJECT, STATE_DIR = al.HOME, al.PROJECT, al.STATE_DIR
+herdr = al.herdr
+VIEW = (sys.argv[1] if len(sys.argv) > 1 else "all").lower().lstrip("#")
+STATE = f"{STATE_DIR}/open-{VIEW}.json"
+FOLLOW_HIDDEN = f"{STATE_DIR}/followups-hidden.json"
+LAST_DONE = f"{STATE_DIR}/last-done.json"
+MAX_OPEN = 10  # more open sessions than this: close the "can close" ones before opening new ones
+HELP = "e home · Enter open · n session · s quick · g next needs-you · c close · a add · x done · u undo · m now↔next · r refresh · q quit"
+HOME_HELP = "e all tasks · p plan · Enter open · n session · s quick · g next needs-you · c close · x done · u undo · a add/accept · h hide · q quit"
+
+
+def workspace_for(area):
+    """herdr workspace a task's sessions open in: its area name ('Home' for #home), 'Tasks' for untagged."""
+    if area == "quick":
+        return "Quick"
+    return "Tasks" if area in ("", "other") else area.capitalize()
+
+
+# ---------- data ----------
+
+class Model:
+    def __init__(self):
+        self.sessions, self.tasks, self.agents, self.verdicts = [], [], {}, {}
+        self.mode = "home" if VIEW == "all" else "explore"
+        self.done = set()
+        self.sidebar = None
+        self.todo_mtime = None
+        self.status = ""
+        self.sessions_at = 0
+
+    def load(self):
+        self.sessions = tv.load_sessions()
+        self.sessions_at = time.time()
+        self.reload_tasks()
+        self.load_agents()
+        self.report_sidebar()
+
+    def reload_tasks(self):
+        self.tasks = tv.build(self.sessions + self.fresh_sessions())
+        self.done = tv.done_sids()
+        try:
+            self.todo_mtime = os.path.getmtime(tv.PATH)
+        except OSError:
+            self.todo_mtime = None
+
+    def tick(self):
+        """Cheap checks every 2 seconds: todo.md edits, open agents; the session list every 2 minutes."""
+        if time.time() - self.sessions_at > 120:
+            self.sessions, self.sessions_at = tv.load_sessions(), time.time()
+            self.reload_tasks()
+        try:
+            if os.path.getmtime(tv.PATH) != self.todo_mtime:
+                self.reload_tasks()
+        except OSError:
+            pass
+        self.load_agents()
+        self.report_sidebar()
+
+    def report_sidebar(self):
+        """herdr sidebar: under each workspace one line of what its sessions need ($work); for every Claude pane its
+        name ($name), what it needs from you ($verdict) and the brief's progress ($progress, $eta, $doing)."""
+        self.verdicts = {sid: self.verdict_of(sid, a) for sid, a in self.agents.items()}
+        if not al.in_herdr() or VIEW != "all":
+            return
+        label_of = {w["workspace_id"]: w["label"] for w in herdr("workspace", "list").get("workspaces", [])}
+        counts = {}
+        for sid, a in self.agents.items():
+            kind = self.verdicts[sid][1]
+            ws = counts.setdefault(label_of.get(a["workspace_id"], ""), {})
+            ws[kind] = ws.get(kind, 0) + 1
+        wanted = {}
+        for label in set(label_of.values()):
+            c = counts.get(label, {})
+            wanted[label] = " · ".join(f"{c[k]} {word}" for k, word in (("you", "need you"), ("working", "working"),
+                                                                         ("close", "can close"), ("paused", "paused"))
+                                       if c.get(k))
+        free, _ = disk()
+        wanted["Today"] = " · ".join(p for p in (wanted.get("Today", ""), f"disk {free:.0f}GB") if p)
+        panes = {}
+        for sid, a in self.agents.items():
+            panes[a["pane_id"]] = (self.session_name(sid)[:60], self.verdicts[sid][0]) + progress_tokens(sid)
+        if (wanted, panes) == self.sidebar:
+            return
+        ids = {v: k for k, v in label_of.items()}
+        for label, work in wanted.items():
+            if label in ids:
+                args = ["--token", f"work={work}"] if work else ["--clear-token", "work"]
+                herdr("workspace", "report-metadata", ids[label], "--source", "today", *args)
+        for pane, (name, verdict, progress, eta, doing) in panes.items():
+            args = []
+            for token, value in (("progress", progress), ("eta", eta), ("doing", doing)):
+                args += ["--token", f"{token}={value}"] if value else ["--clear-token", token]
+            herdr("pane", "report-metadata", pane, "--source", "today", "--token", f"name={name}",
+                  "--token", f"verdict={verdict}", *args)
+        self.sidebar = (wanted, panes)
+
+    def task_of_session(self, sid):
+        """The one open task tagged with this session, or None (untagged, or tagged on several tasks)."""
+        tagged = [t for t in self.tasks if any(sid.startswith(p) for p in t["sids"])]
+        return tagged[0] if len(tagged) == 1 else None
+
+    def session_name(self, sid):
+        """Short name for a session: its brief's name, else its task, else the session title."""
+        b = al.read_brief(sid)
+        if b.get("name"):
+            return b["name"]
+        title = next((s["title"] for s in self.sessions if s["sid"] == sid), "")
+        if sid in al.quick_sids():
+            return "quick: " + (title or "new")
+        t = self.task_of_session(sid)
+        if t:
+            return tv.display_text(t["text"])
+        a = self.agents.get(sid, {})
+        return a.get("terminal_title_stripped") or title or sid[:8]
+
+    def verdict_of(self, sid, agent):
+        done = any(sid.startswith(p) for p in self.done) and not self.task_of_session(sid)
+        return al.verdict(agent, task_done=done, quick=sid in al.quick_sids())
+
+    def ensure_brief_panes(self):
+        """A brief pane on the right of every Claude pane that has none (not in the Today tab itself)."""
+        if not al.in_herdr() or VIEW != "all":
+            return
+        panes = herdr("pane", "list").get("panes", [])
+        tabs = {}
+        for p in panes:
+            tabs.setdefault(p["tab_id"], []).append(p)
+        for sid, a in self.agents.items():
+            mates = tabs.get(a["tab_id"], [])
+            titles = " ".join(p.get("terminal_title_stripped", "") for p in mates)
+            if "brief " in titles or "/today" in titles or "/brief" in titles:
+                continue
+            herdr("pane", "split", a["pane_id"], "--direction", "right", "--ratio", "0.68", "--cwd", HOME, "--no-focus")
+            new = [p for p in herdr("pane", "list", "--workspace", a["workspace_id"]).get("panes", [])
+                   if p["tab_id"] == a["tab_id"] and p["pane_id"] not in {m["pane_id"] for m in mates}]
+            for p in new:
+                herdr("pane", "run", p["pane_id"], f"clear; while true; do {BIN}/brief {sid}; sleep 1; done")
+
+    def load_agents(self):
+        agents = {}
+        for a in herdr("agent", "list").get("agents", []):
+            sid = (a.get("agent_session") or {}).get("value")
+            if sid:
+                agents[sid] = a
+        changed = set(agents) != set(self.agents)
+        self.agents = agents
+        if changed:
+            self.reload_tasks()
+            self.ensure_brief_panes()
+
+    def fresh_sessions(self):
+        """Sessions open in herdr that have no transcript yet (started, nothing typed): show them anyway."""
+        known = {s["sid"] for s in self.sessions}
+        today = datetime.date.today().isoformat()
+        return [dict(sid=sid, title="new session (nothing typed yet)", date=today, mtime=time.time(),
+                     cwd=a.get("cwd", PROJECT), resume=f"claude --resume {sid}", first="")
+                for sid, a in self.agents.items() if sid not in known]
+
+
+def disk():
+    total, _, free = shutil.disk_usage(tv.DISK)
+    return free / 1e9, free / total * 100
+
+
+def progress_tokens(sid):
+    """(progress, eta, doing) for the herdr sidebar from the session brief: '██████░░░░ 60%', '~40 min' and the
+    brief's status cut to the panel width. All '' when the brief has no progress field."""
+    b = al.read_brief(sid)
+    progress = al.progress_line(b)
+    if not progress:
+        return "", "", ""
+    return progress, al.eta_of(b), al.short(b.get("status", ""), SIDEBAR_TEXT)
+
+
+SIDEBAR_TEXT = 32  # herdr sidebar_width 34 minus the left margin
+
+
+# ---------- rows ----------
+
+URGENCY = {"you": 0, "working": 1, "paused": 2, "close": 3}
+
+
+def wanted(t):
+    return VIEW == "all" or t["area"] == VIEW
+
+
+def home_rows(model):
+    rows = []
+    now = [t for t in model.tasks if t["section"] == "now"]
+    rows.append(dict(id="home:today", depth=0, kind="lane", obj="Today (# Now)", count=len(now)))
+    if now:
+        number = 0
+        for row in task_rows(model, now, 1, "home"):
+            if row["kind"] == "task":
+                number += 1
+                row["num"] = number
+            rows.append(row)
+    else:
+        rows.append(dict(id="home:empty", depth=1, kind="info", obj="Nothing planned yet: press p to plan the day"))
+    if model.agents:
+        def most_urgent(sid):
+            return URGENCY.get(model.verdicts.get(sid, ("", "paused"))[1], 2), -model.agents[sid].get("state_change_seq", 0)
+        sids = sorted(model.agents, key=most_urgent)
+        kinds = [model.verdicts.get(sid, ("", "paused"))[1] for sid in sids]
+        summary = " · ".join(f"{kinds.count(k)} {w}" for k, w in (("you", "need you"), ("working", "working"),
+                                                                 ("close", "can close"), ("paused", "paused"))
+                             if kinds.count(k))
+        title = f"Open sessions: {summary}"
+        if len(sids) > MAX_OPEN:
+            title += f"  ⚠ over {MAX_OPEN}: close the 'can close' ones first"
+        rows.append(dict(id="home:agents", depth=0, kind="lane", obj=title, count=len(sids), warn=len(sids) > MAX_OPEN))
+        if is_open("home:agents", True):
+            rows += [dict(id="agent:" + sid, depth=1, kind="agent", obj=sid) for sid in sids]
+    follow = followups(model)
+    if follow:
+        rows.append(dict(id="home:follow", depth=0, kind="lane",
+                         obj="Follow-ups from sessions (a add to todo · h hide)", count=len(follow)))
+        if is_open("home:follow", True):
+            rows += [dict(id="follow:" + f["id"], depth=1, kind="followup", obj=f) for f in follow]
+    jobs = recent_jobs()
+    if jobs:
+        old_failures = [j for j in jobs if retried(j, jobs)]
+        jobs = [j for j in jobs if j not in old_failures]
+        running = sum(1 for j in jobs if j.get("exit") is None)
+        note = f" · {len(old_failures)} failed earlier, retried (hidden)" if old_failures else ""
+        rows.append(dict(id="home:jobs", depth=0, kind="lane",
+                         obj=f"Background jobs: {running} running · {len(jobs) - running} finished (24 h){note}",
+                         count=len(jobs)))
+        if is_open("home:jobs", True):
+            rows += [dict(id="job:" + j["id"], depth=1, kind="job", obj=j) for j in jobs]
+    rest = [t for t in model.tasks if t["section"] != "now"]
+    if rest:
+        rows.append(dict(id="home:more", depth=0, kind="inbox",
+                         obj=f"{len(rest)} more tasks in Next / Waiting: e opens the full tree"))
+    return rows
+
+
+def tree(model):
+    if model.mode == "home":
+        return home_rows(model)
+    tasks = [t for t in model.tasks if wanted(t)]
+    order = {s: i for i, s in enumerate(tv.SECTIONS)}
+    def by_section(t):
+        return order.get(t["section"], len(order))
+    rows = []
+    for area in tv.areas(tasks):
+        mine = sorted([t for t in tasks if t["area"] == area], key=by_section)
+        aid = f"area:{area}"
+        rows.append(dict(id=aid, depth=0, kind="lane", obj="#" + area if area != "other" else "Other (no #area)",
+                         count=len(mine), area=area))
+        if is_open(aid, True):
+            rows += task_rows(model, mine, 1, "tree")
+    if not rows:
+        rows.append(dict(id="tree:empty", depth=0, kind="info", obj=f"no open tasks in {tv.PATH}: press a to add one"))
+    return rows
+
+
+def task_rows(model, tasks, depth, lane):
+    rows = []
+    for t in tasks:
+        tid = f"{lane}:task:{t['text'][:60]}"
+        rows.append(dict(id=tid, depth=depth, kind="task", obj=t, count=len(t["sessions"]), area=t["area"]))
+        if is_open(tid, False):
+            rows.append(dict(id=tid + ":new", depth=depth + 1, kind="new", obj=t, area=t["area"]))
+            for sess in t["sessions"]:
+                rows.append(dict(id=tid + ":s:" + sess["sid"], depth=depth + 1, kind="session", obj=sess, task=t,
+                                 area=t["area"]))
+    return rows
+
+
+def recent_jobs():
+    """Jobs started with ./job in the last 24 hours, running first."""
+    out = []
+    for path in glob.glob(f"{al.JOBS}/*.json"):
+        try:
+            j = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        if time.time() - j.get("started", 0) < 86400:
+            out.append(j)
+    def running_then_newest(j):
+        return j.get("exit") is not None, -j.get("started", 0)
+    return sorted(out, key=running_then_newest)
+
+
+def retried(job, jobs):
+    """A failed job that the same session followed with a later job that is running or finished fine: the agent
+    fixed it and ran again, so the old failure is history."""
+    if job.get("exit") in (None, 0) or not job.get("sid"):
+        return False
+    for later in jobs:
+        if later.get("sid") == job["sid"] and later.get("started", 0) > job.get("started", 0) \
+                and later.get("exit") in (None, 0):
+            return True
+    return False
+
+
+def followups(model):
+    """Promises written in session briefs (last 30 days) that are not in todo.md yet and not hidden."""
+    try:
+        todo_text = open(tv.PATH).read().lower()
+    except OSError:
+        todo_text = ""
+    try:
+        hidden = set(json.load(open(FOLLOW_HIDDEN)))
+    except (OSError, ValueError):
+        hidden = set()
+    out = []
+    for path in sorted(glob.glob(f"{al.BRIEFS}/*.md"), key=os.path.getmtime, reverse=True):
+        sid8 = os.path.basename(path)[:8]
+        b = al.read_brief(sid8)
+        if time.time() - b.get("mtime", 0) > 30 * 86400:
+            continue
+        for item in b.get("promises", []):
+            fid = f"{sid8}:{item[:60]}"
+            if fid in hidden or item[:40].lower() in todo_text:
+                continue
+            out.append(dict(id=fid, sid8=sid8, text=item, name=b.get("name") or sid8))
+    return out
+
+
+def hide_followup(f):
+    try:
+        hidden = set(json.load(open(FOLLOW_HIDDEN)))
+    except (OSError, ValueError):
+        hidden = set()
+    hidden.add(f["id"])
+    os.makedirs(STATE_DIR, exist_ok=True)
+    json.dump(sorted(hidden), open(FOLLOW_HIDDEN, "w"))
+
+
+def accept_followup(model, f):
+    """Add a session's promise to # Next, in the area of the session's task, tagged with the session."""
+    task = next((t for t in model.tasks if any(s["sid"].startswith(f["sid8"]) for s in t["sessions"])), None)
+    area = f" #{task['area']}" if task and task["area"] != "other" else ""
+    lines = read_lines()
+    insert_into(lines, "next", f"- [ ] {f['text']}{area} [s:{f['sid8']}]")
+    write_lines(lines)
+    model.reload_tasks()
+    return "added to Next"
+
+
+def next_needing_me(model):
+    """g: focus the next open session that needs you (answer or permission), oldest wait first, cycling."""
+    waiting = [sid for sid, v in model.verdicts.items() if v[1] == "you" and sid in model.agents]
+    if not waiting:
+        return "nobody needs you right now"
+    def longest_wait(sid):
+        return al.tail(sid)[2]
+    waiting.sort(key=longest_wait)
+    last = getattr(model, "last_g", None)
+    i = (waiting.index(last) + 1) % len(waiting) if last in waiting else 0
+    sid = model.last_g = waiting[i]
+    agent = model.agents[sid]
+    herdr("workspace", "focus", agent["workspace_id"])
+    herdr("agent", "focus", agent["pane_id"])
+    return f"{i + 1}/{len(waiting)} needs you: {model.session_name(sid)[:50]}"
+
+
+OPEN = {}
+
+
+def load_state():
+    global OPEN
+    try:
+        OPEN = json.load(open(STATE))
+    except (OSError, ValueError):
+        OPEN = {}
+
+
+def save_state():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    json.dump(OPEN, open(STATE, "w"))
+
+
+def is_open(node, default):
+    return OPEN.get(node, default)
+
+
+def toggle(node, default):
+    OPEN[node] = not is_open(node, default)
+    save_state()
+
+
+def row_default(row):
+    """Lanes and areas start open; tasks start closed."""
+    return row["kind"] == "lane"
+
+
+# ---------- herdr ----------
+
+LAST_OPENED = {}  # pane id and session id of the last tab opened, for todayctl's first prompt
+
+
+def open_in_herdr(area, label, cwd, command, focus=True):
+    """New tab in the area's workspace running command; outside herdr just say what to run."""
+    if not al.in_herdr():
+        return f"not in herdr; run: cd {shlex.quote(cwd)} && {command}"
+    name = workspace_for(area)
+    ws = next((w["workspace_id"] for w in herdr("workspace", "list").get("workspaces", []) if w["label"] == name), None)
+    if not ws:
+        ws = herdr("workspace", "create", "--label", name, "--cwd", HOME, "--no-focus")["workspace"]["workspace_id"]
+    tab = herdr("tab", "create", "--workspace", ws, "--cwd", cwd, "--label", label[:28],
+                "--focus" if focus else "--no-focus")
+    herdr("pane", "run", tab["root_pane"]["pane_id"], command)
+    LAST_OPENED["pane"] = tab["root_pane"]["pane_id"]
+    if focus:
+        herdr("workspace", "focus", ws)
+    return f"opened in {name}"
+
+
+def focus_agent(agent):
+    herdr("workspace", "focus", agent["workspace_id"])
+    herdr("agent", "focus", agent["pane_id"])
+
+
+def go_to_session(model, row):
+    s = row["obj"]
+    agent = model.agents.get(s["sid"])
+    if agent:  # already open somewhere: jump there instead of opening a second copy
+        focus_agent(agent)
+        return "switched to the open session"
+    cwd = s["cwd"] if os.path.isdir(s["cwd"]) else PROJECT
+    return open_in_herdr(row.get("area", ""), s["title"], cwd, "clear; " + s["resume"])
+
+
+# ---------- todo.md edits ----------
+
+def read_lines():
+    try:
+        return open(tv.PATH).read().splitlines()
+    except OSError:
+        return ["# Now", "", "# Next", "", "# Waiting", "", "# Done"]
+
+
+def write_lines(lines):
+    os.makedirs(os.path.dirname(tv.PATH) or ".", exist_ok=True)
+    tmp = tv.PATH + ".tmp"
+    open(tmp, "w").write("\n".join(lines) + "\n")
+    os.replace(tmp, tv.PATH)
+
+
+def insert_into(lines, section, item):
+    """Add item as the first entry of # <section>, creating the section if it is missing."""
+    at = next((i for i, l in enumerate(lines) if l.strip().lower().startswith("# " + section)), None)
+    if at is None:
+        lines += ["", "# " + section.capitalize(), item]
+    else:
+        lines.insert(at + 1, item)
+
+
+def take_todo_line(lines, task):
+    """Remove and return the task's own line, or None if the file changed since we read it."""
+    n = task.get("line")
+    if n is not None and n < len(lines) and lines[n] == task["raw"]:
+        return lines.pop(n)
+    return None
+
+
+def tag_task(task, sid8):
+    lines = read_lines()
+    n = task["line"]
+    if not (n < len(lines) and lines[n] == task["raw"]):
+        return False
+    lines[n] = lines[n].rstrip() + f" [s:{sid8}]"
+    write_lines(lines)
+    return True
+
+
+def mark_done(task):
+    lines = read_lines()
+    line = take_todo_line(lines, task)
+    if line is None:
+        return "todo.md changed, try again"
+    line = re.sub(r"^- \[ \]", "- [x]", line) if line.startswith("- [ ]") else "- [x] " + line[2:]
+    done_line = f"{line} ({datetime.date.today().isoformat()})"
+    insert_into(lines, "done", done_line)
+    write_lines(lines)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    json.dump({"done": done_line, "raw": task["raw"], "section": task["section"]}, open(LAST_DONE, "w"))
+    return "done: " + task["text"][:50] + "  (u = undo)"
+
+
+def undo_done():
+    """u: put the last task ticked with x back where it was."""
+    try:
+        last = json.load(open(LAST_DONE))
+    except (OSError, ValueError):
+        return "nothing to undo"
+    lines = read_lines()
+    if last["done"] not in lines:
+        return "the Done line was changed or removed; edit todo.md by hand"
+    lines.remove(last["done"])
+    section = last["section"] if last["section"] in tv.SECTIONS else "next"
+    insert_into(lines, section, last["raw"])
+    write_lines(lines)
+    os.remove(LAST_DONE)
+    return f"back in {section.capitalize()}"
+
+
+def toggle_now(task):
+    lines = read_lines()
+    line = take_todo_line(lines, task)
+    if line is None:
+        return "todo.md changed, try again"
+    target = "next" if task["section"] == "now" else "now"
+    insert_into(lines, target, line)
+    write_lines(lines)
+    return f"moved to {target.capitalize()}"
+
+
+def add_task(text, area="", section="next"):
+    """Add '- [ ] text #area' to # Next (or # Now). The area tag is added only if the text has none."""
+    lines = read_lines()
+    tag = f" #{area}" if area and area != "other" and not tv.AREA_TAG.search(text) else ""
+    insert_into(lines, section, f"- [ ] {text}{tag}")
+    write_lines(lines)
+    return f"added to {section.capitalize()}"
+
+
+def plan_day(win, model):
+    """p: pick today's tasks. Digits toggle, Enter saves: ticked go to # Now, unticked planned ones back to # Next."""
+    now = [t for t in model.tasks if t["section"] == "now"]
+    later = [t for t in model.tasks if t["section"] == "next"]
+    cands = (now + later)[:10]
+    if not cands:
+        return "nothing to plan from: add tasks first (a)"
+    checked = [t["section"] == "now" for t in cands]
+    win.timeout(-1)
+    try:
+        while True:
+            h, w = win.getmaxyx()
+            win.erase()
+            put(win, 0, 0, "Plan the day", curses.A_BOLD)
+            put(win, 1, 0, "1-9/0 tick or untick · Enter save to # Now · q cancel. Aim for 3.", curses.A_DIM)
+            y = 3
+            for i, t in enumerate(cands):
+                mark = "[x]" if checked[i] else "[ ]"
+                box = curses.A_BOLD | (curses.color_pair(GRN) if checked[i] else 0)
+                for n, line in enumerate(layout([(f"{(i + 1) % 10} {mark} ", box), (tv.display_text(t["text"]), 0)], w, 0)):
+                    x = 0 if n == 0 else 4
+                    for text, attr in line:
+                        x = put(win, y, x, text, attr)
+                    y += 1
+            put(win, y + 1, 0, f"{sum(checked)} ticked", curses.A_DIM)
+            win.refresh()
+            ch = read_key(win)
+            if ch in (ord("q"), 27):
+                if ch == 27:
+                    read_mouse(win)
+                return "plan unchanged"
+            if ch in (10, 13, curses.KEY_ENTER):
+                break
+            if ord("0") <= ch <= ord("9"):
+                i = (ch - ord("1")) % 10
+                if i < len(cands):
+                    checked[i] = not checked[i]
+    finally:
+        win.timeout(2000)
+    lines = read_lines()
+    for t, tick in zip(cands, checked):
+        if tick == (t["section"] == "now") or t["raw"] not in lines:
+            continue
+        lines.remove(t["raw"])  # by text, not index: earlier moves shift the line numbers
+        insert_into(lines, "now" if tick else "next", t["raw"])
+    write_lines(lines)
+    model.reload_tasks()
+    return f"planned {sum(checked)} for today"
+
+
+# ---------- sessions ----------
+
+def earlier_sessions(task):
+    """Links to earlier Claude sessions on this task, for the new session's context. Links only, no quotes."""
+    lines = [f"- {s['date']} · {s['title']} · session {s['sid'][:8]} · {al.transcript(s['sid'])}"
+             for s in task["sessions"] if al.transcript(s["sid"])]
+    if not lines:
+        return ""
+    return ("\nEarlier Claude sessions on this task (transcripts as JSONL; open one only if it is needed):\n"
+            + "\n".join(lines) + "\n")
+
+
+def last_brief(task):
+    """The newest brief of the task's earlier sessions, so a new session starts where the last one stopped."""
+    for s in task["sessions"]:
+        b = al.read_brief(s["sid"])
+        if b:
+            return f"\nWhere the last session on this task stopped (its brief, {s['date']}, session {s['sid'][:8]}):\n{b['text']}\n"
+    return ""
+
+
+def too_many(model):
+    closable = sum(1 for v in model.verdicts.values() if v[1] == "close")
+    if len(model.agents) >= MAX_OPEN:
+        return f"  ·  {len(model.agents)} sessions open" + (f", {closable} can close (c)" if closable else "")
+    return ""
+
+
+def context_file(sid, text):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = f"{STATE_DIR}/task-{sid[:8]}.txt"
+    open(path, "w").write(text)
+    return path
+
+
+def quick_session(model):
+    """s: a Claude session for a quick question, not tied to a task. Opens in the Quick workspace."""
+    sid = str(uuid.uuid4())
+    al.mark_quick(sid)
+    LAST_OPENED["sid"] = sid
+    ctx = context_file(sid, (
+        "This is a quick-question session, not tied to a task in my todo list. Answer and help directly. "
+        "If it grows into real work (code changes, more than one sitting), say so in one line and suggest adding a "
+        f"task for it. Your session tag is [s:{sid[:8]}]. Wait for my first message.\n"))
+    cmd = f"clear; claude --session-id {sid} -n quick --append-system-prompt-file {shlex.quote(ctx)}"
+    return open_in_herdr("quick", "quick", PROJECT, cmd) + too_many(model)
+
+
+def new_session(model, task, focus=True):
+    """n: a new Claude session on a task. Tags the task line with [s:<first 8 of the id>] first, then starts
+    `claude --session-id <id>` with the task, the last brief and earlier sessions as extra system prompt."""
+    sid = str(uuid.uuid4())
+    LAST_OPENED["sid"] = sid
+    if not tag_task(task, sid[:8]):
+        model.reload_tasks()
+        return "todo.md changed, try again"
+    text = (f"This session works on a task from my todo list ({tv.PATH}): {tv.display_text(task['text'])}. "
+            f"The task line already carries this session's tag [s:{sid[:8]}]. "
+            "Wait for my first message before doing anything.\n")
+    ctx = context_file(sid, text + last_brief(task) + earlier_sessions(task))
+    name = tv.AREA_TAG.sub("", tv.display_text(task["text"])).strip()[:50]
+    cmd = f"clear; claude --session-id {sid} -n {shlex.quote(name)} --append-system-prompt-file {shlex.quote(ctx)}"
+    model.reload_tasks()
+    return open_in_herdr(task["area"], name, PROJECT, cmd, focus) + too_many(model)
+
+
+def close_session(model, row):
+    """c: close the selected open session after a handoff (it updates its brief), in the background."""
+    sid = row["obj"] if row["kind"] == "agent" else (row["obj"]["sid"] if row["kind"] == "session" else None)
+    agent = model.agents.get(sid) if sid else None
+    if not agent:
+        return "select an open session (Open sessions, or a ↳ row that is open)"
+    if agent.get("agent_status") == "working":
+        return "it is working: wait, or press C in its brief pane to close now"
+    subprocess.Popen([f"{BIN}/agent-close", agent["pane_id"], sid], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    return f"closing {model.session_name(sid)[:40]}: handoff first, then the pane closes"
+
+
+# ---------- drawing ----------
+
+RED, YEL, GRN, CYN = 1, 2, 3, 4
+VERDICT_COLOUR = {"working": GRN, "you": RED, "close": CYN, "paused": 0}
+SEL_BG = 238  # dark grey background for the selected row (reverse video turns coloured text black)
+SELECTED = False
+
+
+def colours():
+    curses.start_color()
+    curses.use_default_colors()
+    bg = SEL_BG if curses.COLORS >= 256 else curses.COLOR_BLUE
+    for i, c in enumerate([curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_GREEN, curses.COLOR_CYAN], start=1):
+        curses.init_pair(i, c, -1)
+        curses.init_pair(10 + i, c, bg)
+    curses.init_pair(10, -1, bg)
+
+
+def cp(n):
+    """Colour pair n, on the highlight background when drawing the selected row."""
+    if SELECTED:
+        return curses.color_pair(10 + n)
+    return curses.color_pair(n) if n else 0
+
+
+def put(win, y, x, text, attr=0):
+    if SELECTED and not attr & curses.A_COLOR:
+        attr |= curses.color_pair(10)
+    h, w = win.getmaxyx()
+    if 0 <= y < h and x < w - 1:
+        try:
+            win.addstr(y, x, text[:max(0, w - 1 - x)], attr)
+        except curses.error:
+            pass
+    return x + len(text)
+
+
+def agent_badge(model, sid):
+    """('● needs you: answer', colour) for an open session, or None."""
+    v = model.verdicts.get(sid)
+    if not v and sid in model.agents:
+        v = model.verdict_of(sid, model.agents[sid])
+    if not v:
+        return None
+    return "● " + v[0], VERDICT_COLOUR.get(v[1], 0)
+
+
+def row_segments(row, model, selected):
+    """The row as (text, attr) pieces; layout() wraps them to the pane width."""
+    global SELECTED
+    SELECTED = selected
+    attr = curses.A_BOLD if selected else 0
+    seg = []
+    kind, o = row["kind"], row["obj"]
+    folder = kind in ("lane", "task")
+    seg.append((("▾ " if is_open(row["id"], row_default(row)) else "▸ ") if folder else "  ", attr | curses.A_DIM))
+    if kind == "info":
+        seg.append((o, attr | curses.A_DIM))
+    elif kind == "inbox":
+        seg.append(("→ " + o, attr | cp(YEL)))
+    elif kind == "lane":
+        seg.append((o, attr | curses.A_BOLD | cp(RED if row.get("warn") else CYN)))
+        seg.append((f"  · {row['count']}", attr | curses.A_DIM))
+    elif kind == "task":
+        if row.get("num"):
+            seg.append((f"{row['num']} ", attr | curses.A_BOLD))
+        chip, colour = {"now": ("now", YEL), "next": ("next", 0), "waiting": ("wait", 0)}.get(o["section"], ("", 0))
+        if not (row["id"].startswith("home:") and chip == "now"):  # every task under Today is "now"
+            seg.append((chip + " ", attr | (cp(colour) if colour else curses.A_DIM)))
+        seg.append((tv.display_text(o["text"]), attr))
+        if o["due"]:
+            late = o["due"] < datetime.date.today().isoformat()
+            seg.append((f"  due {o['due']}", attr | (cp(RED) if late else curses.A_DIM)))
+        live = [s["sid"] for s in o["sessions"] if s["sid"] in model.agents]
+        if live:
+            def most_urgent(sid):
+                return URGENCY.get(model.verdicts.get(sid, ("", "paused"))[1], 2)
+            badge = agent_badge(model, sorted(live, key=most_urgent)[0])
+            if badge:
+                seg.append(("  " + badge[0] + (f" (+{len(live) - 1} open)" if len(live) > 1 else ""), attr | cp(badge[1])))
+        elif row["count"]:
+            seg.append((f"  · {row['count']} session{'s' if row['count'] != 1 else ''}", attr | curses.A_DIM))
+    elif kind == "agent":
+        badge = agent_badge(model, o) or ("● open", 0)
+        seg.append((badge[0] + "  ", attr | cp(badge[1])))
+        seg.append((model.session_name(o), attr | curses.A_BOLD))
+        progress, eta, _ = progress_tokens(o)
+        if progress:
+            seg.append(("  " + progress + (f" · {eta}" if eta else ""), attr | cp(GRN)))
+        nxt = al.read_brief(o).get("next")
+        if nxt:
+            seg.append(("  next: " + nxt, attr | curses.A_DIM))
+    elif kind == "job":
+        if o.get("exit") is None:
+            seg.append((f"● running {al.ago(time.time() - o['started'])}  ", attr | cp(YEL)))
+        else:
+            ok = o["exit"] == 0
+            seg.append((("✓ done" if ok else f"✗ failed ({o['exit']})") + f" {al.ago(time.time() - o['ended'])} ago  ",
+                        attr | cp(GRN if ok else RED)))
+        seg.append((o["label"], attr | curses.A_BOLD))
+        if o.get("sid"):
+            seg.append((f"  for {o['sid'][:8]}", attr | curses.A_DIM))
+        seg.append(("  " + o.get("last", "")[:100], attr | curses.A_DIM))
+    elif kind == "followup":
+        seg.append(("☐ ", attr | cp(YEL)))
+        seg.append((o["text"], attr))
+        seg.append((f"  from {o['name'][:40]}", attr | curses.A_DIM))
+    elif kind == "new":
+        seg.append(("[+ new session]", attr | cp(CYN) | curses.A_BOLD))
+    elif kind == "session":
+        seg.append(("↳ ", attr | cp(CYN)))
+        seg.append((o["date"][5:] + " ", attr | curses.A_DIM))
+        seg.append((o["title"], attr))
+        badge = agent_badge(model, o["sid"])
+        if badge:
+            seg.append(("  " + badge[0], attr | cp(badge[1])))
+        nxt = al.read_brief(o["sid"]).get("next")
+        if nxt:
+            seg.append(("  next: " + nxt, attr | curses.A_DIM))
+        seg.append(("  " + o["sid"][:8], attr | curses.A_DIM))
+    return seg
+
+
+def layout(segments, width, indent):
+    """Wrap (text, attr) pieces into lines of at most width cells. Continuation lines start at indent + 4."""
+    lines, line, used = [], [], indent
+    cont = indent + 4
+    for text, attr in segments:
+        for word in re.split(r"(\s+)", text):
+            if not word:
+                continue
+            if used + len(word) > width - 1 and line and not word.isspace():
+                lines.append(line)
+                line, used = [], cont
+                word = word.lstrip()
+            elif used + len(word) > width - 1 and word.isspace():
+                continue
+            while used + len(word) > width - 1:  # a single word longer than the line
+                cut = width - 1 - used
+                line.append((word[:cut], attr))
+                lines.append(line)
+                line, used, word = [], cont, word[cut:]
+            line.append((word, attr))
+            used += len(word)
+    if line:
+        lines.append(line)
+    return lines or [[]]
+
+
+def cut_line(line, width):
+    """First line of a wrapped row with an ellipsis at the end."""
+    used = sum(len(t) for t, _ in line)
+    if used < width - 2:
+        return line + [("…", curses.A_DIM)]
+    out, room = [], width - 3
+    for text, attr in line:
+        out.append((text[:max(0, room)], attr))
+        room -= len(text)
+    return out + [("…", curses.A_DIM)]
+
+
+def row_lines(row, model, selected, width):
+    indent = 2 * row["depth"]
+    return indent, layout(row_segments(row, model, selected), width, indent)
+
+
+def row_height(rows, i, sel, width, model):
+    return len(row_lines(rows[i], model, False, width)[1]) if i == sel else 1
+
+
+def draw_row(win, y, row, selected, width, model, max_lines):
+    """Draw a row; returns how many screen lines it took. One line each, cut with "…"; only the selected row wraps."""
+    global SELECTED
+    indent, lines = row_lines(row, model, selected, width)
+    if not selected and len(lines) > 1:
+        lines = [cut_line(lines[0], width)]
+    for i, line in enumerate(lines[:max_lines]):
+        SELECTED = selected
+        put(win, y + i, 0, " " * (width - 1), curses.A_BOLD if selected else 0)
+        x = indent if i == 0 else indent + 4
+        for text, attr in line:
+            x = put(win, y + i, x, text, attr)
+    return min(len(lines), max_lines)
+
+
+REFRESH = "[↻ refresh]"
+
+
+def draw_header(win, model, width):
+    title = "Today" if VIEW == "all" else "#" + VIEW
+    x = put(win, 0, 0, title, curses.A_BOLD)
+    if VIEW == "all" and model.mode == "explore":
+        x = put(win, 0, x, "  › all tasks  ", curses.color_pair(YEL) | curses.A_BOLD)
+        x = put(win, 0, x, "[← home]", curses.color_pair(CYN) | curses.A_BOLD)
+        model.home_at = (x - len("[← home]"), x)
+    else:
+        model.home_at = (0, 0)
+    x = put(win, 0, x, f"  {datetime.datetime.now():%H:%M}  ", curses.A_DIM)
+    model.refresh_at = (x, x + len(REFRESH))
+    put(win, 0, x, REFRESH, curses.color_pair(CYN) | curses.A_BOLD)
+    free, pct = disk()
+    c = RED if free < 20 or pct < 10 else (YEL if pct < 20 else GRN)
+    x = put(win, 1, 0, "Disk ", curses.A_BOLD)
+    put(win, 1, x, f"{free:.0f} GB free ({pct:.0f}%)", curses.color_pair(c))
+    note = f"{tv.PATH.replace(HOME, '~')}" + (f"  ·  {model.status}" if model.status else "")
+    put(win, 2, 0, note, curses.A_DIM)
+    return 4
+
+
+# ---------- input ----------
+
+def read_key(win):
+    """Next key as an int like getch(), with letters typed on the Russian layout mapped to the English key in the
+    same place, so hotkeys work on either layout. -1 when nothing was pressed before the timeout."""
+    try:
+        ch = win.get_wch()
+    except curses.error:
+        return -1
+    if isinstance(ch, int):
+        return ch
+    return ord(al.latin(ch))
+
+
+def mouse_on():
+    """Ask for click + wheel reports in SGR form (ESC [ < b ; x ; y M/m) and parse them ourselves: older
+    ncurses builds only understand the X10 form and would hand us a bare Esc."""
+    sys.stdout.write("\033[?1000h\033[?1006h")
+    sys.stdout.flush()
+
+
+def mouse_off():
+    sys.stdout.write("\033[?1006l\033[?1000l")
+    sys.stdout.flush()
+
+
+def read_mouse(win):
+    """After an Esc: read the rest of a mouse report. Returns (button, x, y, pressed), 0-based, or None."""
+    win.nodelay(True)
+    chars = []
+    try:
+        while len(chars) < 32:
+            c = win.getch()
+            if c == -1:
+                break
+            chars.append(c)
+            if chars[:2] == [ord("["), ord("<")] and chr(c) in "Mm":
+                break
+            if chars[:2] == [ord("["), ord("M")] and len(chars) == 5:
+                break
+    finally:
+        win.nodelay(False)
+        win.timeout(2000)
+    text = "".join(chr(c) for c in chars if c < 0x110000)
+    m = re.fullmatch(r"\[<(\d+);(\d+);(\d+)([Mm])", text)
+    if m:
+        return int(m.group(1)), int(m.group(2)) - 1, int(m.group(3)) - 1, m.group(4) == "M"
+    if text.startswith("[M") and len(chars) == 5:  # X10: ESC [ M b x y, each + 32
+        b = chars[2] - 32
+        return (b & ~3 if b & 64 else b & 3), chars[3] - 33, chars[4] - 33, (b & 3) != 3
+    return None
+
+
+def ask(win, prompt):
+    """One-line text input on the bottom row. Enter = done, Esc = cancel."""
+    h, w = win.getmaxyx()
+    text = ""
+    win.timeout(-1)
+    curses.curs_set(1)
+    try:
+        while True:
+            put(win, h - 1, 0, " " * (w - 1))
+            put(win, h - 1, 0, prompt, curses.A_BOLD)
+            put(win, h - 1, len(prompt), text[-(w - len(prompt) - 2):])
+            win.refresh()
+            ch = win.get_wch()
+            if ch in ("\n", "\r", curses.KEY_ENTER):
+                return text.strip()
+            if ch == "\x1b":
+                read_mouse(win)
+                return ""
+            if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                text = text[:-1]
+            elif isinstance(ch, str) and ch.isprintable():
+                text += ch
+    finally:
+        curses.curs_set(0)
+        win.timeout(2000)
+
+
+def selected_task(rows, sel):
+    if not rows:
+        return None
+    row = rows[sel]
+    if row["kind"] in ("task", "new"):
+        return row["obj"]
+    return row.get("task")
+
+
+def area_at(rows, sel):
+    """Area for a new task: the selected task's or area row's, or the one above it."""
+    for i in range(sel, -1, -1):
+        if rows and rows[i].get("area"):
+            return rows[i]["area"]
+    return VIEW if VIEW != "all" else ""
+
+
+def scroll_to(rows, sel, top, body, width, model):
+    """First row to draw so the selected row is fully on screen (rows can wrap onto several lines)."""
+    if not rows:
+        return 0
+    top = min(top, sel)
+    def height(i):
+        return row_height(rows, i, sel, width, model)
+    while top < sel and sum(height(i) for i in range(top, sel + 1)) > body:
+        top += 1
+    return top
+
+
+def activate(model, row):
+    kind = row["kind"]
+    if kind in ("lane", "task"):
+        toggle(row["id"], row_default(row))
+    elif kind == "new":
+        return new_session(model, row["obj"])
+    elif kind == "session":
+        return go_to_session(model, row)
+    elif kind == "job":
+        subprocess.Popen(["open", "-e", row["obj"]["log"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "opened the log"
+    elif kind == "agent":
+        agent = model.agents.get(row["obj"])
+        if agent:
+            focus_agent(agent)
+            return "switched to the session"
+    elif kind == "inbox":
+        model.mode = "explore"
+        return "all tasks (e to go back)"
+    return None
+
+
+def run(win):
+    curses.curs_set(0)
+    colours()
+    mouse_on()
+    win.timeout(2000)
+    model = Model()
+    load_state()
+    model.load()
+    sel, top = 0, 0
+    global SELECTED
+    while True:
+        rows = tree(model)
+        sel = max(0, min(sel, len(rows) - 1))
+        h, w = win.getmaxyx()
+        win.erase()
+        first = draw_header(win, model, w)
+        body = h - first - 1
+        top = scroll_to(rows, sel, top, body, w, model)
+        screen = {}  # screen line -> row index, for mouse clicks
+        y = first
+        for i in range(top, len(rows)):
+            if y >= first + body:
+                break
+            used = draw_row(win, y, rows[i], i == sel, w, model, first + body - y)
+            for line in range(y, y + used):
+                screen[line] = i
+            y += used
+        SELECTED = False
+        put(win, h - 1, 0, HOME_HELP if model.mode == "home" else HELP, curses.A_DIM)
+        win.refresh()
+
+        key = read_key(win)
+        if key == -1:
+            model.tick()
+            continue
+        row = rows[sel] if rows else {"kind": "none", "id": "", "depth": 0}
+        if key == 27:
+            mouse = read_mouse(win)
+            if not mouse or not mouse[3]:
+                continue  # bare Esc / unknown sequence / button release: ignore, never quit
+            button, mx, my, _ = mouse
+            if button == 64:
+                sel -= 3
+            elif button == 65:
+                sel += 3
+            elif button == 0 and my == 0 and model.home_at[0] <= mx < model.home_at[1]:
+                model.mode, sel, top = "home", 0, 0
+            elif button == 0 and my == 0 and model.refresh_at[0] <= mx < model.refresh_at[1]:
+                model.load()
+                model.status = "refreshed"
+            elif button == 0 and my in screen:
+                sel = screen[my]
+                model.status = activate(model, rows[sel]) or model.status
+            continue
+        if key == ord("q"):
+            return
+        if key == ord("e"):
+            model.mode = "explore" if model.mode == "home" else "home"
+            sel, top = 0, 0
+        elif key == ord("p"):
+            model.status = plan_day(win, model) or model.status
+        elif key == ord("h") and row["kind"] == "followup":
+            hide_followup(row["obj"])
+            model.status = "hidden"
+        elif key == ord("a") and row["kind"] == "followup":
+            model.status = accept_followup(model, row["obj"])
+        elif key == ord("u"):
+            model.status = undo_done()
+            model.reload_tasks()
+        elif key == ord("g"):
+            model.status = next_needing_me(model)
+        elif key == ord("s"):
+            model.status = quick_session(model)
+        elif key == ord("c") and rows:
+            model.status = close_session(model, row)
+        elif key in (ord("r"), ord("R")):
+            model.load()
+            model.status = "refreshed"
+        elif key in (curses.KEY_DOWN, ord("j")):
+            sel += 1
+        elif key in (curses.KEY_UP, ord("k")):
+            sel -= 1
+        elif key == curses.KEY_NPAGE:
+            sel += body
+        elif key == curses.KEY_PPAGE:
+            sel -= body
+        elif key in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT, ord("l"), ord(" ")) and rows:
+            model.status = activate(model, row) or model.status
+        elif key in (curses.KEY_LEFT, ord("h")) and rows:
+            if row["kind"] in ("lane", "task") and is_open(row["id"], row_default(row)):
+                toggle(row["id"], row_default(row))
+            else:
+                sel = next((i for i in range(sel - 1, -1, -1) if rows[i]["depth"] < row["depth"]), sel)
+        elif key == ord("n"):
+            task = selected_task(rows, sel)
+            if task:
+                model.status = new_session(model, task)
+        elif key == ord("x"):
+            task = selected_task(rows, sel)
+            if task:
+                model.status = mark_done(task)
+                model.reload_tasks()
+        elif key == ord("m"):
+            task = selected_task(rows, sel)
+            if task:
+                model.status = toggle_now(task)
+                model.reload_tasks()
+        elif key == ord("a"):
+            area = area_at(rows, sel)
+            text = ask(win, f"New task{' for #' + area if area and area != 'other' else ''}: ")
+            if text:
+                model.status = add_task(text, area)
+                model.reload_tasks()
+
+
+if __name__ == "__main__":
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(run)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        mouse_off()
